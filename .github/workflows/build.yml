@@ -1,0 +1,130 @@
+# Builds rusty_v8 149.4.0 (V8 14.9.207.2) as a static library for x86_64-pc-windows-msvc with the
+# v8 crate features v8_enable_pointer_compression and simdutf. rusty_v8 publishes that combination
+# for no target, and deno_core 0.408.0 always turns on simdutf, so a pointer-compressed V8 under
+# deno_core needs both. The steps follow the "build" job of rusty_v8's .github/workflows/ci.yml at
+# tag v149.4.0 for its Windows release entry; each departure from it carries a comment.
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: release x86_64-pc-windows-msvc ptrcomp simdutf
+    runs-on: windows-2022
+    # Cold builds of rusty_v8's Windows release job on windows-2022 took 63 to 116 minutes in forks
+    # of rusty_v8 (no compile cache); GitHub ends a job at 360.
+    timeout-minutes: 300
+    env:
+      V8_FROM_SOURCE: true
+      TARGET: x86_64-pc-windows-msvc
+      RUSTY_V8_SHA: dd1b4e9c743b7a11dbeb99d4d0dc55979218b905
+      # The v8 crate's build.rs (prebuilt_features_suffix) appends _ptrcomp, then _simdutf, then
+      # _<profile>_<target>; RUSTY_V8_ARCHIVE and RUSTY_V8_SRC_BINDING_PATH users match on it.
+      SUFFIX: _ptrcomp_simdutf_release_x86_64-pc-windows-msvc
+      # rusty_v8's ci.yml also sets RUSTFLAGS=-D warnings. It is left out: a Rust warning changes
+      # neither the V8 library nor the generated binding, so it should not fail this build.
+
+    steps:
+      - name: Configure git
+        # core.longpaths: this repository's name puts the workspace 28 characters deeper than
+        # rusty_v8's own (D:\a\rusty_v8\rusty_v8).
+        run: |
+          git config --global core.symlinks true
+          git config --global core.longpaths true
+
+      - name: Check out denoland/rusty_v8 at v149.4.0
+        uses: actions/checkout@v4
+        with:
+          repository: denoland/rusty_v8
+          # the commit tag v149.4.0 points to; a sha cannot be moved the way a tag can
+          ref: dd1b4e9c743b7a11dbeb99d4d0dc55979218b905
+          fetch-depth: 10
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check the source and print the V8 version
+        shell: bash
+        # tr strips carriage returns: git on this runner may check text files out with CRLF endings.
+        run: |
+          test "$(git rev-parse HEAD)" = "$RUSTY_V8_SHA"
+          tr -d '\r' < Cargo.toml | grep -q '^version = "149.4.0"$'
+          v=$(tr -d '\r' < v8/include/v8-version.h \
+            | awk '/^#define V8_(MAJOR_VERSION|MINOR_VERSION|BUILD_NUMBER|PATCH_LEVEL) /{print $3}' \
+            | paste -sd.)
+          echo "V8 version: $v"
+          echo "V8 version: $v (rusty_v8 149.4.0, $RUSTY_V8_SHA)" >> "$GITHUB_STEP_SUMMARY"
+          test "$v" = 14.9.207.2
+
+      - name: Install Rust from rust-toolchain.toml
+        uses: dsherret/rust-toolchain-file@v1
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Install python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11.x
+          architecture: x64
+
+      # Departure: rusty_v8's ci.yml adds sccache and actions/cache here. A first build has nothing
+      # cached, so they would only add steps; build.rs then prints "Not using sccache or ccache".
+
+      - name: Show free disk before the build
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
+
+      # pwsh, the shell rusty_v8's ci.yml runs cargo in on Windows. -vv shows the V8 build
+      # script's GN and ninja output, so a failure inside V8's build is in the log.
+      - name: Build V8, the crate and its tests
+        run: cargo build -vv --all-targets --locked --release --target ${{ env.TARGET }} --features v8_enable_pointer_compression --features simdutf
+
+      - name: Show free disk after the build
+        if: always()
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
+
+      - name: Check the GN args carry both features
+        shell: bash
+        run: |
+          gn_out="target/$TARGET/release/gn_out"
+          cat "$gn_out/args.gn"
+          grep -Eq 'v8_enable_pointer_compression *= *true' "$gn_out/args.gn"
+          grep -Eq 'rusty_v8_enable_simdutf *= *true' "$gn_out/args.gn"
+
+      # Same commands as ci.yml's "Prepare binary publish", with this build's names.
+      - name: Name the library and binding as build.rs expects
+        shell: bash
+        run: |
+          gn_out="target/$TARGET/release/gn_out"
+          mkdir -p dist
+          gzip -9c "$gn_out/obj/rusty_v8.lib" > "dist/rusty_v8${SUFFIX}.lib.gz"
+          cp "$gn_out/src_binding.rs" "dist/src_binding${SUFFIX}.rs"
+          cp "$gn_out/args.gn" dist/args.gn
+          cd dist
+          sha256sum "rusty_v8${SUFFIX}.lib.gz" "src_binding${SUFFIX}.rs" args.gn > SHA256SUMS
+          ls -l
+          cat SHA256SUMS
+          { echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the library and binding
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusty_v8${{ env.SUFFIX }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+      # After the upload, so a red test still leaves the files to inspect; the files are fit to use
+      # only from a run whose test step passed. rusty_v8 never tests pointer compression on Windows
+      # or together with simdutf, so this suite is the only check of the combination before the host.
+      - name: Test (rusty_v8's suite against this build)
+        run: cargo nextest run --all-targets --locked --release --target ${{ env.TARGET }} --features v8_enable_pointer_compression --features simdutf

@@ -1,0 +1,3 @@
+# rusty-v8-ptrcomp-build
+
+This repository builds rusty_v8 149.4.0 (V8 14.9.207.2) as a Windows x64 MSVC static library with the v8 crate features `v8_enable_pointer_compression` and `simdutf`, a combination rusty_v8 does not publish, for an embedder that links deno_core 0.408.0 unchanged. Its one workflow, `.github/workflows/build.yml`, checks out denoland/rusty_v8 at tag v149.4.0, builds and tests it the way rusty_v8's own CI builds its Windows release, and uploads `rusty_v8_ptrcomp_simdutf_release_x86_64-pc-windows-msvc.lib.gz` and the generated binding `src_binding_ptrcomp_simdutf_release_x86_64-pc-windows-msvc.rs` as workflow artifacts.
